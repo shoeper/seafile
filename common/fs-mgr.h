@@ -14,11 +14,26 @@
 #include "../common/seafile-crypt.h"
 
 typedef struct _SeafFSManager SeafFSManager;
+typedef struct _SeafFSObject SeafFSObject;
 typedef struct _Seafile Seafile;
 typedef struct _SeafDir SeafDir;
 typedef struct _SeafDirent SeafDirent;
 
+typedef enum {
+    SEAF_METADATA_TYPE_INVALID,
+    SEAF_METADATA_TYPE_FILE,
+    SEAF_METADATA_TYPE_LINK,
+    SEAF_METADATA_TYPE_DIR,
+} SeafMetadataType;
+
+/* Common to seafile and seafdir objects. */
+struct _SeafFSObject {
+    int type;
+};
+
 struct _Seafile {
+    SeafFSObject object;
+    int         version;
     char        file_id[41];
     guint64     file_size;
     guint32     n_blocks;
@@ -32,36 +47,36 @@ seafile_ref (Seafile *seafile);
 void
 seafile_unref (Seafile *seafile);
 
-typedef enum {
-    SEAF_METADATA_TYPE_INVALID,
-    SEAF_METADATA_TYPE_FILE,
-    SEAF_METADATA_TYPE_LINK,
-    SEAF_METADATA_TYPE_DIR,
-} SeafMetadataType;
-
 #define SEAF_DIR_NAME_LEN 256
-
 
 struct _SeafDirent {
     guint32    mode;
     char       id[41];
     guint32    name_len;
-    char       name[SEAF_DIR_NAME_LEN];
+    char       *name;
+
+    /* attributes for version > 0 */
+    gint64     mtime;
+    char       *modifier;       /* for files only */
+    gint64     size;            /* for files only */
 };
 
 struct _SeafDir {
+    SeafFSObject object;
+    int    version;
     char   dir_id[41];
     GList *entries;
 };
 
 SeafDir *
-seaf_dir_new (const char *id, GList *entries, gint64 ctime);
+seaf_dir_new (int version, const char *id, GList *entries);
 
 void 
 seaf_dir_free (SeafDir *dir);
 
 SeafDir *
-seaf_dir_from_data (const char *dir_id, const uint8_t *data, int len);
+seaf_dir_from_data (const char *dir_id, const uint8_t *data, int len,
+                    gboolean is_json);
 
 int 
 seaf_dir_save (SeafFSManager *fs_mgr,
@@ -69,14 +84,18 @@ seaf_dir_save (SeafFSManager *fs_mgr,
                int version,
                SeafDir *dir);
 
-int
-seaf_metadata_type_from_data (const uint8_t *data, int len);
-
 SeafDirent *
-seaf_dirent_new (const char *sha1, int mode, const char *name);
+seaf_dirent_new (int version, const char *sha1, int mode, const char *name,
+                 gint64 mtime, const char *modifier, gint64 size);
+
+void
+seaf_dirent_free (SeafDirent *dent);
 
 SeafDirent *
 seaf_dirent_dup (SeafDirent *dent);
+
+int
+seaf_metadata_type_from_data (const uint8_t *data, int len);
 
 typedef struct {
     /* TODO: GHashTable may be inefficient when we have large number of IDs. */

@@ -304,25 +304,76 @@ bad:
 
 #endif /* SEAFILE_SERVER */
 
+static void *
+create_seafile_v0 (CDCFileDescriptor *cdc, int *ondisk_size, char *seafile_id)
+{
+    SeafileOndisk *ondisk;
+
+    rawdata_to_hex (cdc->file_sum, seafile_id, 20);
+
+    *ondisk_size = sizeof(SeafileOndisk) + cdc->block_nr * 20;
+    ondisk = (SeafileOndisk *)g_new0 (char, *ondisk_size);
+
+    ondisk->type = htonl(SEAF_METADATA_TYPE_FILE);
+    ondisk->file_size = hton64 (cdc->file_size);
+    memcpy (ondisk->block_ids, cdc->blk_sha1s, cdc->block_nr * 20);
+
+    return ondisk;
+}
+
+static void *
+create_seafile_json (int repo_version,
+                     CDCFileDescriptor *cdc,
+                     int *ondisk_size,
+                     char *seafile_id)
+{
+    json_t *object, *block_id_array;
+
+    object = json_object ();
+
+    json_object_set_int_member (object, "type", SEAFILE_METADATA_TYPE_FILE);
+    json_object_set_int_member (object, "version", 1);
+
+    json_object_set_int_member (object, "size", cdc->file_size);
+
+    block_id_array = json_array ();
+    int i;
+    uint8_t *ptr = cdc->blk_sha1s;
+    char block_id[41];
+    for (i = 0; i < cdc->block_nr; ++i) {
+        rawdata_to_hex (ptr, block_id, 20);
+        json_array_append_new (block_id_array, json_string(block_id));
+        ptr += 20;
+    }
+    json_object_set_new (object, "block_ids", block_id_array);
+
+    char *data = json_dumps (object, 0);
+    *ondisk_size = strlen(data);
+
+    /* The seafile object id is sha1 hash of the json object. */
+    unsigned char sha1[20];
+    calculate_sha1 (sha1, data);
+    rawdata_to_hex (sha1, seafile_id, 20);
+
+    json_decref (object);
+    return data;
+}
+
 static int
 write_seafile (SeafFSManager *fs_mgr,
                const char *repo_id,
                int version,
                CDCFileDescriptor *cdc)
 {
-    char seafile_id[41];
-    SeafileOndisk *ondisk;
-    int ondisk_size;
     int ret = 0;
+    void *ondisk;
+    char seafile_id[41];
+    int ondisk_size;
 
-    rawdata_to_hex (cdc->file_sum, seafile_id, 20);
-
-    ondisk_size = sizeof(SeafileOndisk) + cdc->block_nr * 20;
-    ondisk = (SeafileOndisk *)g_new0 (char, ondisk_size);
-
-    ondisk->type = htonl(SEAF_METADATA_TYPE_FILE);
-    ondisk->file_size = hton64 (cdc->file_size);
-    memcpy (ondisk->block_ids, cdc->blk_sha1s, cdc->block_nr * 20);
+    if (version > 0)
+        ondisk = create_seafile_json (repo_version, cdc, &ondisk_size, seafile_id);
+    else
+        ondisk = create_seafile_v0 (cdc, &ondisk_size, seafile_id);
 
     if (seaf_obj_store_write_obj (fs_mgr->obj_store, repo_id, version, seafile_id,
                                   ondisk, ondisk_size, FALSE) < 0)
@@ -630,8 +681,38 @@ out:
     return ret;
 }
 
-Seafile *
-seafile_from_data (const char *id, const void *data, int len)
+void
+seafile_ref (Seafile *seafile)
+{
+    ++seafile->ref_count;
+}
+
+static void
+seafile_free (Seafile *seafile)
+{
+    int i;
+
+    if (seafile->blk_sha1s) {
+        for (i = 0; i < seafile->n_blocks; ++i)
+            g_free (seafile->blk_sha1s[i]);
+        g_free (seafile->blk_sha1s);
+    }
+
+    g_free (seafile);
+}
+
+void
+seafile_unref (Seafile *seafile)
+{
+    if (!seafile)
+        return;
+
+    if (--seafile->ref_count <= 0)
+        seafile_free (seafile);
+}
+
+static Seafile *
+seafile_from_v0_data (const char *id, const void *data, int len)
 {
     const SeafileOndisk *ondisk = data;
     Seafile *seafile;
@@ -674,41 +755,97 @@ seafile_from_data (const char *id, const void *data, int len)
     return seafile;
 }
 
-void *
+static Seafile *
+seafile_from_json (const char *id, const void *data, int len)
+{
+    json_t *object = NULL;
+    json_t *block_id_array = NULL;
+    json_error_t error;
+    int type;
+    const char *file_id;
+    int version;
+    guint64 file_size;
+    Seafile *seafile = NULL;
+
+    object = json_loadb (data, len, 0, &error);
+    if (!object) {
+        if (error.text)
+            g_warning ("Failed to load seafile json object: %s.\n", error.text);
+        else
+            g_warning ("Failed to load seafile json object.\n");
+        return NULL;
+    }
+
+    /* Sanity checks. */
+    type = json_object_get_int_member (object, "type");
+    if (type != SEAF_METADATA_TYPE_FILE) {
+        seaf_warning ("Object %s is not a file.\n", id);
+        json_decref (object);
+        return NULL;
+    }
+
+    version = (int) json_object_get_int_member (object, "version");
+    if (version < 1) {
+        seaf_warning ("Seafile object %s version should be > 0, version is %d.\n",
+                      id, version);
+        json_decref (object);
+        return NULL;
+    }
+
+    file_size = (guint64) json_object_get_int_member (object, "size");
+
+    block_id_array = json_object_get (object, "block_ids");
+    if (!block_id_array) {
+        seaf_warning ("No block id array in seafile object %s.\n", id);
+        json_decref (object);
+        return NULL;
+    }
+
+    seafile = g_new0 (Seafile, 1);
+
+    seafile->object.type = SEAF_METADATA_TYPE_FILE;
+
+    memcpy (seafile->file_id, id, 40);
+    seafile->version = version;
+    seafile->size = file_size;
+    seafile->n_blocks = json_array_size (block_id_array);
+    seafile->blk_sha1s = g_new0 (char *, seafile->n_blocks);
+
+    int i;
+    json_t block_id_obj;
+    const char *block_id;
+    for (i = 0; i < seafile->n_blocks; ++i) {
+        block_id_obj = json_array_get (block_id_array, i);
+        block_id = json_string_value (block_id_obj);
+        if (!block_id) {
+            seafile_free (seafile);
+            json_decref (object);
+            return NULL;
+        }
+        seafile->blk_sha1s[i] = g_strdup(block_id);
+    }
+
+    json_decref (object);
+
+    seafile->ref_count = 1;
+
+    return dir;
+}
+
+static Seafile *
+seafile_from_data (const char *id, const void *data, int len, gboolean is_json)
+{
+    if (is_json)
+        return seafile_from_json (id, data, len);
+    else
+        return seafile_from_v0_data (id, data, len);
+}
+
+static void *
 seafile_to_data (Seafile *seafile, int *len)
 {
     /* XXX: not implemented yet. */
     return NULL;
-}
-
-void
-seafile_ref (Seafile *seafile)
-{
-    ++seafile->ref_count;
-}
-
-static void
-seafile_free (Seafile *seafile)
-{
-    int i;
-
-    if (seafile->blk_sha1s) {
-        for (i = 0; i < seafile->n_blocks; ++i)
-            g_free (seafile->blk_sha1s[i]);
-        g_free (seafile->blk_sha1s);
-    }
-
-    g_free (seafile);
-}
-
-void
-seafile_unref (Seafile *seafile)
-{
-    if (!seafile)
-        return;
-
-    if (--seafile->ref_count <= 0)
-        seafile_free (seafile);
 }
 
 Seafile *
@@ -756,7 +893,7 @@ seaf_fs_manager_get_seafile (SeafFSManager *mgr,
     return seafile;
 }
 
-static void compute_dir_id (SeafDir *dir, GList *entries)
+static void compute_dir_id_v0 (SeafDir *dir, GList *entries)
 {
     SHA_CTX ctx;
     GList *p;
@@ -788,18 +925,23 @@ static void compute_dir_id (SeafDir *dir, GList *entries)
 }
 
 SeafDir *
-seaf_dir_new (const char *id, GList *entries, gint64 ctime)
+seaf_dir_new (int version, const char *id, GList *entries)
 {
     SeafDir *dir;
 
     dir = g_new0(SeafDir, 1);
 
-    if (id == NULL)
-        compute_dir_id (dir, entries);
-    else {
+    dir->version = version;
+    if (id != NULL) {
         memcpy(dir->dir_id, id, 40);
         dir->dir_id[40] = '\0';
+    } else if (version == 0) {
+        compute_dir_id_v0 (dir, entries);
     }
+    /* Dir id for version > 0 is computed before the object is saved.
+     * The id for new objects is computed by hashing the json object.
+     * This will be more efficient for fsck.
+     */
 
     dir->entries = entries;
 
@@ -814,7 +956,7 @@ seaf_dir_free (SeafDir *dir)
 
     GList *ptr = dir->entries;
     while (ptr) {
-        g_free (ptr->data);
+        seaf_dirent_free ((SeafDirent *)ptr->data);
         ptr = ptr->next;
     }
 
@@ -822,8 +964,53 @@ seaf_dir_free (SeafDir *dir)
     g_free(dir);
 }
 
-SeafDir *
-seaf_dir_from_data (const char *dir_id, const uint8_t *data, int len)
+SeafDirent *
+seaf_dirent_new (int version, const char *sha1, int mode, const char *name,
+                 gint64 mtime, const char *modifier, gint64 size)
+{
+    SeafDirent *dent;
+
+    dent = g_new0 (SeafDirent, 1);
+    memcpy(dent->id, sha1, 40);
+    dent->id[40] = '\0';
+    dent->mode = mode;
+    dent->name = g_strdup(name);
+    dent->name_len = strlen(name);
+
+    if (version > 0) {
+        dent->mtime = mtime;
+        if (S_ISREG(mode)) {
+            dent->modifier = g_strdup(modifier);
+            dent->size = size;
+        }
+    }
+
+    return dent;
+}
+
+void 
+seaf_dirent_free (SeafDirent *dent)
+{
+    g_free (dent->name);
+    g_free (dent->modifier);
+    g_free (dent);
+}
+
+SeafDirent *
+seaf_dirent_dup (SeafDirent *dent)
+{
+    SeafDirent *new_dent;
+
+    new_dent = g_memdup (dent, sizeof(SeafDirent));
+    new_dent->name = g_strdup(dent->name);
+    if (dent->version > 0)
+        new_dent->modifier = g_strdup(dent->modifier);
+
+    return new_dent;
+}
+
+static SeafDir *
+parse_v0_seaf_dir (const char *dir_id, const uint8_t *data, int len)
 {
     SeafDir *root;
     SeafDirent *dent;
@@ -844,6 +1031,8 @@ seaf_dir_from_data (const char *dir_id, const uint8_t *data, int len)
     }
 
     root = g_new0(SeafDir, 1);
+    root->object.type = SEAF_METADATA_TYPE_DIR;
+    root->version = 0;
     memcpy(root->dir_id, dir_id, 40);
     root->dir_id[40] = '\0';
 
@@ -880,8 +1069,137 @@ bad:
     return NULL;
 }
 
-int
-seaf_metadata_type_from_data (const uint8_t *data, int len)
+static SeafDirent *
+parse_dirent (const char *dir_id, json_t *object)
+{
+    guint32 mode;
+    const char *id;
+    const char *name;
+    gint64 mtime;
+    const char *modifier;
+    gint64 size;
+
+    mode = (guint32) json_object_get_int_member (object, "mode");
+
+    id = json_object_get_string_member (object, "id");
+    if (!id) {
+        seaf_warning ("Dirent id not set for dir object %s.\n", dir_id);
+        return NULL;
+    }
+
+    name = json_object_get_string_member (object, "name");
+    if (!name) {
+        seaf_warning ("Dirent name not set for dir object %s.\n", dir_id);
+        return NULL;
+    }
+
+    mtime = json_object_get_int_member (object, "mtime");
+    if (S_ISREG(mode)) {
+        modifier = json_object_get_string_member (object, "modifier");
+        if (!modifier) {
+            seaf_warning ("Dirent modifier not set for dir object %s.\n", dir_id);
+            return NULL;
+        }
+        size = json_object_get_int_member (object, "size");
+    }
+
+    SeafDirent *dirent = g_new0 (SeafDirent, 1);
+    dirent->mode = mode;
+    memcpy (dirent->id, id, 40);
+    dirent->name_len = strlen(name);
+    dirent->name = g_strdup(name);
+    dirent->mtime = mtime;
+    if (S_ISREG(mode)) {
+        dirent->modifier = g_strdup(modifier);
+        dirent->size = size;
+    }
+
+    return dirent;
+}
+
+static SeafDir *
+parse_json_seaf_dir (const char *dir_id, const uint8_t *data, int len)
+{
+    json_t *object = NULL;
+    json_t *dirent_array = NULL;
+    json_error_t error;
+    int type;
+    const char *id;
+    int version;
+    SeafDir *dir = NULL;
+
+    object = json_loadb (data, len, 0, &error);
+    if (!object) {
+        if (error.text)
+            g_warning ("Failed to load seafdir json object: %s.\n", error.text);
+        else
+            g_warning ("Failed to load seafdir json object.\n");
+        return NULL;
+    }
+
+    /* Sanity checks. */
+    type = json_object_get_int_member (object, "type");
+    if (type != SEAF_METADATA_TYPE_DIR) {
+        seaf_warning ("Object %s is not a dir.\n", dir_id);
+        json_decref (object);
+        return NULL;
+    }
+
+    version = (int) json_object_get_int_member (object, "version");
+    if (version < 1) {
+        seaf_warning ("Dir object %s version should be > 0, version is %d.\n",
+                      dir_id, version);
+        json_decref (object);
+        return NULL;
+    }
+
+    dirent_array = json_object_get (object, "dirents");
+    if (!dirent_array) {
+        seaf_warning ("No dirents in dir object %s.\n", dir_id);
+        json_decref (object);
+        return NULL;
+    }
+
+    dir = g_new0 (SeafDir, 1);
+
+    dir->object.type = SEAF_METADATA_TYPE_DIR;
+
+    memcpy (dir->dir_id, dir_id, 40);
+    dir->version = version;
+
+    size_t n_dirents = json_array_size (dirent_array);
+    int i;
+    json_t dirent_obj;
+    SeafDirent *dirent;
+    for (i = 0; i < n_dirents; ++i) {
+        dirent_obj = json_array_get (dirent_array, i);
+        dirent = parse_dirent (dirent_obj);
+        if (!dirent) {
+            seaf_dir_free (dir);
+            json_decref (object);
+            return NULL;
+        }
+        dir->entries = g_list_prepend (dir->entries, dirent);
+    }
+    dir->entries = g_list_reverse (dir->entries);
+
+    json_decref (object);
+
+    return dir;
+}
+
+SeafDir *
+seaf_dir_from_data (const char *dir_id, const uint8_t *data, int len,
+                    gboolean is_json)
+{
+    if (is_json)
+        return parse_json_seaf_dir (dir_id, data, len);
+    else
+        return parse_v0_seaf_dir (dir_id, data, len);
+}
+
+static int
+parse_metadata_type_v0 (const uint8_t *data, int len)
 {
     const uint8_t *ptr = data;
 
@@ -891,14 +1209,45 @@ seaf_metadata_type_from_data (const uint8_t *data, int len)
     return (int)(get32bit(&ptr));
 }
 
+static int
+parse_metadata_type_json (const uint8_t *data, int len)
+{
+    json_t *object;
+    json_error_t error;
+    int type;
+
+    object = json_loadb (data, len, 0, &error);
+    if (!object) {
+        if (error.text)
+            g_warning ("Failed to load commit json object: %s.\n", error.text);
+        else
+            g_warning ("Failed to load commit json object.\n");
+        return SEAF_METADATA_TYPE_INVALID;
+    }
+
+    type = json_object_get_int_member (object, "type");
+
+    json_decref (object);
+    return type;
+}
+
+int
+seaf_metadata_type_from_data (const uint8_t *data, int len, gboolean is_json)
+{
+    if (is_json)
+        return parse_metadata_type_json (data, len);
+    else
+        return parse_metadata_type_v0 (data, len);
+}
+
 inline static int
 ondisk_dirent_size (SeafDirent *dirent)
 {
     return sizeof(DirentOndisk) + dirent->name_len;
 }
 
-void *
-seaf_dir_to_data (SeafDir *dir, int *len)
+static void *
+seaf_dir_to_v0_data (SeafDir *dir, int *len)
 {
     SeafdirOndisk *ondisk;
     int dir_ondisk_size = sizeof(SeafdirOndisk);
@@ -931,6 +1280,64 @@ seaf_dir_to_data (SeafDir *dir, int *len)
     }
 
     return (void *)ondisk;
+}
+
+static void
+add_to_dirent_array (json_t *array, SeafDirent *dirent)
+{
+    json_t *object;
+
+    object = json_object ();
+    json_object_set_int_member (object, "mode", dirent->mode);
+    json_object_set_string_member (object, "id", dirent->id);
+    json_object_set_string_member (object, "name", dirent->name);
+    json_object_set_int_member (object, "mtime", dirent->mtime);
+    if (S_ISREG(dirent->mode)) {
+        json_object_set_string_member (object, "modifier", dirent->modifier);
+        json_object_set_int_member (object, "size", dirent->size);
+    }
+
+    json_array_append_new (array, object);
+}
+
+static void *
+seaf_dir_to_json (SeafDir *dir, int *len)
+{
+    json_t *object, *dirent_array;
+    GList *ptr;
+    SeafDirent *dirent;
+
+    object = json_object ();
+
+    json_object_set_int_member (object, "type", dir->object.type);
+    json_object_set_int_member (object, "version", dir->version);
+
+    dirent_array = json_array ();
+    for (ptr = dir->entries; ptr; ptr = ptr->next) {
+        dirent = ptr->data;
+        add_to_dirent_array (dirent_array, dirent);
+    }
+    json_object_set_new (object, "dirents", dirent_array);
+
+    char *data = json_dumps (object, 0);
+    *len = strlen(data);
+
+    /* The dir object id is sha1 hash of the json object. */
+    unsigned char sha1[20];
+    calculate_sha1 (sha1, data);
+    rawdata_to_hex (sha1, dir->id, 20);
+
+    json_decref (object);
+    return data;
+}
+
+void *
+seaf_dir_to_data (SeafDir *dir, int *len)
+{
+    if (dir->version > 0)
+        return seaf_dir_to_json (dir, len);
+    else
+        return seaf_dir_to_v0_data (dir, len);
 }
 
 int
@@ -1034,29 +1441,6 @@ seaf_fs_manager_get_seafdir_sorted (SeafFSManager *mgr,
         dir->entries = g_list_sort (dir->entries, compare_dirents);
 
     return dir;
-}
-
-SeafDirent *
-seaf_dirent_new (const char *sha1, int mode, const char *name)
-{
-    SeafDirent *dent;
-
-    dent = g_new0 (SeafDirent, 1);
-    memcpy(dent->id, sha1, 40);
-    dent->id[40] = '\0';
-    dent->mode = mode;
-
-    /* Name would be truncated if it's too long. */
-    dent->name_len = MIN (strlen(name), SEAF_DIR_NAME_LEN - 1);
-    memcpy (dent->name, name, dent->name_len);
-
-    return dent;
-}
-
-SeafDirent *
-seaf_dirent_dup (SeafDirent *dent)
-{
-    return g_memdup (dent, sizeof(SeafDirent));
 }
 
 BlockList *
