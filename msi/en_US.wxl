@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <WixLocalization Culture="en-us" xmlns="http://schemas.microsoft.com/wix/2006/localization">
 
-  <String Id="AppName">HorizonBase</String>
-  <String Id="PackageDescription">HorizonBase Installer</String>
-  <String Id="PackageComments">HorizonBase Installer</String>
-  <String Id="Manufacturer">HorizonBase</String>
-  <String Id="DowngradeErrorMessage">A more up-to-date version of HorizonBase is detected on your machine. The installer will now quit</String>
-  <String Id="UserManualName">HorizonBase help.txt</String>
+  <String Id="AppName">Horizonbase</String>
+  <String Id="PackageDescription">Horizonbase Installer</String>
+  <String Id="PackageComments">Horizonbase Installer</String>
+  <String Id="Manufacturer">Horizonbase</String>
+  <String Id="DowngradeErrorMessage">A more up-to-date version of Horizonbase is detected on your machine. The installer will now quit</String>
+  <String Id="UserManualName">Horizonbase help.txt</String>
   <String Id="UserManualSource">manual.en.txt</String>
-  <String Id="UninstallSeafile">Uninstall HorizonBase</String>
-  <String Id="StartSeafile">Start HorizonBase</String>
-  <String Id="AutoStartText">Start HorizonBase on startup</String>
+  <String Id="UninstallSeafile">Uninstall Horizonbase</String>
+  <String Id="StartSeafile">Start Horizonbase</String>
+  <String Id="AutoStartText">Start Horizonbase on startup</String>
 
 </WixLocalization>

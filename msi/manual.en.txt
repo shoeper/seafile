@@ -1,12 +1,12 @@
-Welcome to use HorizonBase client.
+Welcome to use Horizonbase client.
 
-HorizonBase client is used to download a "library" from a HorizonBase website, which is
+Horizonbase client is used to download a "library" from a Horizonbase website, which is
 different from other file sync service like dropbox.
 
-1. Create a library on HorizonBase website;
+1. Create a library on Horizonbase website;
 
-2. Download the library from HorizonBase website;
+2. Download the library from Horizonbase website;
 
-3. Files added to this donwloaded library will automatically appear on HorizonBase website.
+3. Files added to this donwloaded library will automatically appear on Horizonbase website.
 
-Don't add files to the "HorizonBase" folder. That would not make it appear on the website.
+Don't add files to the "Horizonbase" folder. That would not make it appear on the website.
